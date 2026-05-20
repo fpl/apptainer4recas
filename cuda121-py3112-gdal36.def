@@ -1,0 +1,177 @@
+# ============================================================================
+# Apptainer definition: HPC GPU environment (pip-CUDA variant)
+#
+#   Target host : AlmaLinux 9.x cluster, NVIDIA GPUs
+#   Runtime     : apptainer run/exec --nv  (host driver passthrough)
+#
+#   Design change vs. earlier variants:
+#     System-level CUDA toolkit and cuDNN have been REMOVED.
+#     The container now relies entirely on the NVIDIA pip wheels that
+#     torch / jax / cupy already drag in (nvidia-cuda-runtime-cu12,
+#     nvidia-cublas-cu12, nvidia-cudnn-cu12, nvidia-nccl-cu12, ...).
+#     Saves ~6 GB of duplicated CUDA libraries and eliminates the build-time
+#     space/OOM problems caused by installing CUDA twice (once in the system
+#     prefix, once inside the venv via pip).
+#
+#   Trade-offs to be aware of:
+#     - No `nvcc` and no CUDA C++ headers inside the container. If you need
+#       to compile CUDA kernels at runtime (custom torch C++ extensions,
+#       cupy RawKernel JIT requiring nvrtc-dev, etc.) re-add the runfile
+#       install or use the local-deb-repo route.
+#     - The effective CUDA/cuDNN version is whatever your pinned torch/jax
+#       built against, NOT necessarily 12.1 / 8.9.7.29 anymore. If you need
+#       CUDA 12.1 specifically, pin torch via
+#         pip install torch --index-url https://download.pytorch.org/whl/cu121
+#       and pick a matching jax/cupy. See `requirements.txt`.
+#
+#   Provides:
+#     - Debian 12 (bookworm)  -> GCC/G++ 12.2.0, Python 3.11.2, GDAL 3.6.2
+#     - CUDA runtime + cuDNN  -> via pip wheels (nvidia-*-cu12 family)
+#
+#   Build (point apptainer's tmpdir at REAL DISK with plenty of free space):
+#     export APPTAINER_TMPDIR=/scratch/$USER/apptainer-tmp
+#     mkdir -p "$APPTAINER_TMPDIR"
+#     df -h "$APPTAINER_TMPDIR"        # MUST show enough room (~30 GB+)
+#     apptainer build --fakeroot --tmpdir "$APPTAINER_TMPDIR" \
+#                     hpc-gpsar.sif cuda121-py3112-gdal36.def
+# ============================================================================
+
+Bootstrap: docker
+From: debian:12-slim
+
+%labels
+    Maintainer        Francesco Lovergine
+    ContactEmail      rankie@debian.org
+    Name              HPC-GPSAR
+    BaseOS            Debian 12 (bookworm)
+    CUDA              via pip wheels (nvidia-*-cu12)
+    cuDNN             via pip wheel (nvidia-cudnn-cu12)
+    Python            3.11.2 (distro)
+    GDAL              3.6.2 (distro)
+    GCC               12.2 (distro)
+
+%environment
+    export LANG=C.UTF-8
+    export LC_ALL=C.UTF-8
+
+    # /opt/venv is a --system-site-packages venv: distro python3-gdal stays
+    # visible while pip installs land here (sidesteps PEP 668).
+    export VIRTUAL_ENV=/opt/venv
+    export PATH=/opt/venv/bin:${PATH}
+
+    # GDAL / PROJ runtime data (Debian package paths)
+    export GDAL_DATA=/usr/share/gdal
+    export PROJ_DATA=/usr/share/proj
+    export PROJ_LIB=/usr/share/proj
+
+    # NOTE: no CUDA_HOME / LD_LIBRARY_PATH for /usr/local/cuda — those libs
+    # are not installed in this image. The pip-installed nvidia-*-cu12 wheels
+    # are self-locating via torch/jax/cupy at import time, and libcuda.so is
+    # bind-mounted from the host by `apptainer --nv`.
+
+%setup
+    cp requirements.txt ${APPTAINER_ROOTFS}/opt/requirements.txt
+
+%post
+    set -eux
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    # ------------------------------------------------------------------
+    # Disk hygiene FIRST.
+    # Apptainer auto-bind-mounts the build HOST's /tmp into the container
+    # during %post. We do NOT try to bind a sandbox dir over /tmp -- doing
+    # so breaks the 1777 (sticky world-writable) permissions that apt-key
+    # and other drop-privileges tools rely on, and can also propagate the
+    # host /tmp's `nodev` flag in unexpected ways.
+    # Instead, just steer well-behaved tools (pip, apt, sort, ...) to a
+    # sandbox-internal scratch directory via $TMPDIR. The few tools that
+    # ignore $TMPDIR and write to /tmp directly will use the host /tmp,
+    # which is fine as long as that filesystem has enough room.
+    # ------------------------------------------------------------------
+    mkdir -p /opt/build-scratch
+    chmod 1777 /opt/build-scratch
+    export TMPDIR=/opt/build-scratch
+    export PIP_NO_CACHE_DIR=1
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+    # ---- Distro toolchain, Python 3.11.2, GDAL 3.6.2, build deps ----------
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates wget gnupg pkg-config xz-utils \
+        build-essential cmake git \
+        python3 python3-dev python3-venv python3-pip \
+        libgdal-dev gdal-bin python3-gdal \
+        proj-bin proj-data
+
+    # ---- Project venv (system-site-packages so distro GDAL is visible) ----
+    python3 -m venv --system-site-packages /opt/venv
+    /opt/venv/bin/pip install --upgrade pip setuptools wheel
+
+    # ---- Install the project requirements ---------------------------------
+    # Pip's per-invocation "ephemeral wheel cache" is freed when pip exits.
+    # If a single `pip install -r` peaks too high again, split the install:
+    # put torch/torchvision/torchaudio (and any jax/cupy with CUDA libs)
+    # in requirements-heavy.txt, the rest in requirements.txt, and install
+    # them in two separate pip calls with `rm -rf /opt/build-scratch/pip-ephem-wheel-cache-*`
+    # between them. That keeps peak disk roughly proportional to the largest
+    # single group rather than the full graph.
+    /opt/venv/bin/pip install -r /opt/requirements.txt --upgrade
+
+    # Sweep any lingering pip ephemera before we finalize the image
+    rm -rf /opt/build-scratch/pip-ephem-wheel-cache-* /root/.cache/pip || true
+
+    # ---- Cleanup ----------------------------------------------------------
+    # Be surgical: only remove things we KNOW we created in the sandbox.
+    # Do NOT do `rm -rf /var/tmp/* /tmp/*` -- under Apptainer's default
+    # `mount tmp = yes` those paths contain host-owned files that the
+    # fakeroot uid cannot delete, and the rm will fail under `set -e`.
+    apt-get clean
+    rm -rf /var/lib/apt/lists/* || true
+    rm -rf /opt/build-scratch || true
+
+%test
+    set -e
+    echo "== GCC =="
+    gcc --version | head -n1
+    echo "== Python =="
+    /opt/venv/bin/python --version
+    echo "== GDAL (distro) =="
+    /opt/venv/bin/python -c "from osgeo import gdal; print('GDAL', gdal.__version__)"
+    echo "== CUDA stack reported by pip wheels =="
+    # These checks are CPU-only (no GPU at build time) but tell us which
+    # CUDA/cuDNN versions the pip wheels are linked against. Each import
+    # is independent so a missing optional package won't fail the others.
+    /opt/venv/bin/python -c "import torch; print('torch', torch.__version__, 'built against CUDA', torch.version.cuda, 'cuDNN', torch.backends.cudnn.version())" || echo "torch import skipped"
+    /opt/venv/bin/python -c "import jax; print('jax', jax.__version__)" || echo "jax import skipped"
+    /opt/venv/bin/python -c "import cupy; print('cupy', cupy.__version__)" || echo "cupy import skipped"
+
+%runscript
+    exec /opt/venv/bin/python "$@"
+
+%help
+    HPC-GPSAR: GPU/geospatial environment.
+
+    Debian 12 distro Python 3.11.2 + GDAL 3.6.2. CUDA runtime and cuDNN are
+    supplied entirely by pip wheels (the nvidia-*-cu12 family pulled in by
+    torch / jax / cupy). The system-level CUDA toolkit is intentionally not
+    installed -- no nvcc inside the container.
+
+    Run on the cluster (GPU passthrough requires --nv):
+
+        apptainer exec --nv hpc-gpsar.sif python myscript.py
+        apptainer exec --nv hpc-gpsar.sif nvidia-smi
+
+    The active interpreter is /opt/venv/bin/python (a --system-site-packages
+    venv): distro python3-gdal 3.6.2 is importable, and any `pip install`
+    inside the container lands in the venv without tripping Debian 12's
+    PEP 668 externally-managed restriction.
+
+    Host prerequisites (AlmaLinux 9.x nodes):
+      * NVIDIA driver new enough for whatever CUDA the pinned torch was
+        built against. Verify with: `torch.version.cuda` (in %test output)
+        and cross-check against NVIDIA's driver/CUDA compatibility matrix.
+      * apptainer with --nv support.
+
+    Only the CUDA *userspace* libraries (via pip wheels) ship in the image;
+    the kernel driver and libcuda.so are bind-mounted from the host by --nv.
