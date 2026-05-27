@@ -37,18 +37,18 @@
 # ============================================================================
 
 Bootstrap: docker
-From: debian:12-slim
+From: debian:13-slim
 
 %labels
     Maintainer        Francesco Lovergine
-    ContactEmail      rankie@debian.org
+    ContactEmail      frankie@debian.org
     Name              HPC-GPSAR
-    BaseOS            Debian 12 (bookworm)
+    BaseOS            Debian 13 (trixie)
     CUDA              via pip wheels (nvidia-*-cu12)
     cuDNN             via pip wheel (nvidia-cudnn-cu12)
-    Python            3.11.2 (distro)
-    GDAL              3.6.2 (distro)
-    GCC               12.2 (distro)
+    Python            3.13.5 (distro)
+    GDAL              3.10.3 (distro)
+    GCC               14.2 (distro)
 
 %environment
     export LANG=C.UTF-8
@@ -71,7 +71,6 @@ From: debian:12-slim
 
 %setup
     cp requirements.txt ${APPTAINER_ROOTFS}/opt/requirements.txt
-    cp pkgs/*.deb ${APPTAINER_ROOTFS}/opt/.
 
 %post
     set -eux
@@ -106,7 +105,7 @@ From: debian:12-slim
         ca-certificates wget gnupg pkg-config xz-utils \
         build-essential cmake git \
         python3 python3-dev python3-venv python3-pip \
-        build-essential \
+        build-essential libgdal-dev gdal-bin \
         proj-bin proj-data libproj-dev
 
     # ---- Project venv (system-site-packages so distro GDAL is visible) ----
@@ -123,12 +122,10 @@ From: debian:12-slim
     # between them. That keeps peak disk roughly proportional to the largest
     # single group rather than the full graph.
 
-    dpkg -i /opt/*.deb || apt --fix-broken install -y
-
     /opt/venv/bin/pip install --no-binary gdal gdal=="$(gdal-config --version)"
     /opt/venv/bin/pip install -r /opt/requirements.txt
 
-    cp /usr/lib/python3/dist-packages/osgeo/_gdal_array.cpython-311-x86_64-linux-gnu.so /opt/venv/lib/python3.11/site-packages/osgeo/.
+    cp /usr/lib/python3/dist-packages/osgeo/_gdal_array.cpython-313-x86_64-linux-gnu.so /opt/venv/lib/python3.13/site-packages/osgeo/.
 
     # Sweep any lingering pip ephemera before we finalize the image
     rm -rf /opt/build-scratch/pip-ephem-wheel-cache-* /root/.cache/pip || true
@@ -164,7 +161,7 @@ From: debian:12-slim
 %help
     HPC-GPSAR: GPU/geospatial environment.
 
-    Debian 12 distro Python 3.11.2 + GDAL 3.6.2. CUDA runtime and cuDNN are
+    Debian 12 distro Python 3.13.5 + GDAL 3.10.3. CUDA runtime and cuDNN are
     supplied entirely by pip wheels (the nvidia-*-cu12 family pulled in by
     torch / jax / cupy). The system-level CUDA toolkit is intentionally not
     installed -- no nvcc inside the container.
